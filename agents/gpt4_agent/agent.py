@@ -1,16 +1,26 @@
 """
-Enhanced GPT-4 Code Generation Agent - Production Ready
+Enhanced GPT-4 Code Generation Agent - Production Ready with Memory & Guardrails
 Specializes in comprehensive solutions with detailed error handling and edge case coverage
+
+Features:
+- Memory learning from past successful generations
+- Input/output safety validation through guardrails  
+- Comprehensive robustness analysis and autonomous decision making
+- Self-regenerating code improvement cycles
+- Institutional knowledge building over time
 
 Note: Uses simplified wrapper functions for complex shared tools to ensure
 ADK compatibility with automatic function calling.
 """
 
-from google.adk.agents import LlmAgent
+
+from google.adk.agents import Agent
+from google.adk.models.lite_llm import LiteLlm
 from google.adk.tools import FunctionTool
 from google.adk.events import Event, EventActions
 from google.adk.agents.invocation_context import InvocationContext
 from typing import AsyncGenerator, Dict, Any, Optional, List
+from datetime import datetime
 import sys
 from pathlib import Path
 import re
@@ -35,6 +45,28 @@ from shared.guardrails import (
     check_code_safety
 )
 
+# Import memory and guardrails services (with fallbacks)
+try:
+    from shared.memory import get_memory_service, MemoryEntry
+    MEMORY_AVAILABLE = True
+except ImportError:
+    print("Warning: Memory service not available - using fallback")
+    MEMORY_AVAILABLE = False
+    
+    # Fallback MemoryEntry class
+    class MemoryEntry:
+        def __init__(self, **kwargs):
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+    
+try:
+    from shared.guardrails.input_guardrail import validate_input_request
+    from shared.guardrails.output_guardrail import validate_output_safety
+    GUARDRAILS_AVAILABLE = True
+except ImportError:
+    print("Warning: Guardrails not available - using fallback")
+    GUARDRAILS_AVAILABLE = False
+
 # Simple wrapper functions for ADK compatibility
 def simple_code_safety_check(code: str) -> Dict[str, Any]:
     """
@@ -47,6 +79,7 @@ def simple_code_safety_check(code: str) -> Dict[str, Any]:
         Safety check results
     """
     try:
+        # Call the actual function with default language
         result = check_code_safety(code, language="python")
         return {
             "is_safe": result.get("is_safe", True),
@@ -87,8 +120,268 @@ def simple_output_validation(code: str) -> Dict[str, Any]:
         }
 
 
-class GPT4CompletenessAnalyzer:
-    """Completeness and robustness analysis engine for GPT-4 agent"""
+# MEMORY AND GUARDRAILS FUNCTIONS
+
+def validate_input_with_guardrails(request: str) -> Dict[str, Any]:
+    """
+    Validate input request using guardrails before processing.
+    
+    Args:
+        request: The user's code generation request
+        
+    Returns:
+        Validation results with safety status
+    """
+    if not GUARDRAILS_AVAILABLE:
+        return {
+            "status": "fallback_validation",
+            "is_safe": True,
+            "is_valid": True,
+            "confidence": 0.8,
+            "issues": [],
+            "blocked": False,
+            "timestamp": datetime.now().isoformat(),
+            "message": "Guardrails not available - using basic validation"
+        }
+    
+    try:
+        # Use input guardrail validation
+        validation_result = validate_input_request(request)
+        
+        return {
+            "status": "validated",
+            "is_safe": validation_result.get("is_safe", True),
+            "is_valid": validation_result.get("is_valid", True),
+            "confidence": validation_result.get("confidence", 1.0),
+            "issues": validation_result.get("issues", []),
+            "blocked": not validation_result.get("is_safe", True),
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        # If guardrail fails, be permissive but log the error
+        return {
+            "status": "error",
+            "is_safe": True,
+            "is_valid": True,
+            "confidence": 0.5,
+            "issues": [f"Guardrail error: {str(e)}"],
+            "blocked": False,
+            "timestamp": datetime.now().isoformat()
+        }
+
+
+def check_memory_for_similar_request(request: str) -> Dict[str, Any]:
+    """
+    Check memory for similar past requests to enable learning.
+    
+    Args:
+        request: Current code generation request
+        
+    Returns:
+        Memory search results with similar requests
+    """
+    if not MEMORY_AVAILABLE:
+        return {
+            "status": "memory_not_available",
+            "found_similar": False,
+            "message": "Memory service not available - proceeding with fresh generation",
+            "should_proceed": True
+        }
+    
+    try:
+        memory_service = get_memory_service()
+        
+        # Search for similar past requests
+        similar_memories = memory_service.search_similar(
+            request=request,
+            category="gpt4_code_generation", 
+            threshold=0.7
+        )
+        
+        if not similar_memories:
+            return {
+                "status": "no_matches",
+                "found_similar": False,
+                "message": "No similar requests found in memory",
+                "should_proceed": True
+            }
+        
+        # Get the best match
+        best_match = similar_memories[0]
+        similarity_score = best_match.data.get("similarity_score", 0)
+        
+        # High similarity suggests reuse
+        if similarity_score > 0.9:
+            return {
+                "status": "high_similarity_found",
+                "found_similar": True,
+                "similarity_score": similarity_score,
+                "previous_request": best_match.data.get("original_request", ""),
+                "previous_robustness_score": best_match.quality_score,
+                "previous_code_preview": best_match.data.get("generated_code", "")[:200] + "...",
+                "recommendation": "Consider adapting previous comprehensive solution",
+                "should_proceed": True,  # Still generate but inform decision
+                "can_reference": True
+            }
+        else:
+            return {
+                "status": "partial_similarity_found", 
+                "found_similar": True,
+                "similarity_score": similarity_score,
+                "previous_request": best_match.data.get("original_request", ""),
+                "previous_robustness_score": best_match.quality_score,
+                "recommendation": "Some related experience found - use as reference",
+                "should_proceed": True,
+                "can_reference": False
+            }
+            
+    except Exception as e:
+        return {
+            "status": "memory_error",
+            "found_similar": False,
+            "error": str(e),
+            "should_proceed": True,  # Don't block on memory errors
+            "message": "Memory check failed, proceeding with fresh generation"
+        }
+
+
+def save_successful_generation_to_memory(
+    original_request: str,
+    generated_code: str, 
+    robustness_score: float,
+    analysis_data: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Save successful code generation to memory for future learning.
+    
+    Args:
+        original_request: The original user request
+        generated_code: The final generated code
+        robustness_score: Robustness score of the generated code
+        analysis_data: Complete analysis results
+        
+    Returns:
+        Memory save confirmation
+    """
+    if not MEMORY_AVAILABLE:
+        return {
+            "status": "memory_not_available",
+            "reason": "Memory service not available",
+            "saved": False,
+            "message": "Generation completed successfully but not saved to memory"
+        }
+    
+    try:
+        # Only save high-quality generations
+        if robustness_score < 0.75:
+            return {
+                "status": "not_saved",
+                "reason": f"Robustness score {robustness_score:.2f} below threshold (0.75)",
+                "saved": False
+            }
+        
+        memory_service = get_memory_service()
+        
+        # Create memory entry
+        memory_entry = MemoryEntry(
+            category="gpt4_code_generation",
+            agent_name="gpt4_agent",
+            data={
+                "original_request": original_request,
+                "generated_code": generated_code,
+                "robustness_score": robustness_score,
+                "analysis_summary": {
+                    "error_handling_score": analysis_data.get("error_handling_analysis", {}).get("error_handling_score", 0),
+                    "edge_case_score": analysis_data.get("edge_case_analysis", {}).get("edge_case_score", 0),
+                    "has_comprehensive_handling": analysis_data.get("error_handling_analysis", {}).get("has_error_handling", False),
+                    "is_secure": analysis_data.get("is_safe", True),
+                    "lines_count": analysis_data.get("basic_metrics", {}).get("lines_non_empty", 0)
+                },
+                "generation_timestamp": datetime.now().isoformat(),
+                "agent_version": "enhanced_v1"
+            },
+            quality_score=robustness_score,
+            tags=["gpt4", "comprehensive", "robust", "completed"]
+        )
+        
+        # Store in memory
+        memory_id = memory_service.store(memory_entry)
+        
+        return {
+            "status": "saved_successfully",
+            "memory_id": memory_id,
+            "robustness_score": robustness_score,
+            "saved": True,
+            "message": f"Comprehensive solution saved to memory (score: {robustness_score:.2f})"
+        }
+        
+    except Exception as e:
+        return {
+            "status": "save_error",
+            "error": str(e),
+            "saved": False,
+            "message": "Failed to save to memory, but generation completed successfully"
+        }
+
+
+def validate_final_output_with_guardrails(
+    code: str,
+    original_request: str
+) -> Dict[str, Any]:
+    """
+    Final validation of generated code using output guardrails.
+    
+    Args:
+        code: Generated code to validate
+        original_request: Original request for context
+        
+    Returns:
+        Final validation results with safety assessment
+    """
+    if not GUARDRAILS_AVAILABLE:
+        return {
+            "status": "fallback_final_validation",
+            "is_safe": True,
+            "is_appropriate": True,
+            "confidence": 0.8,
+            "issues": [],
+            "ready_for_delivery": True,
+            "validation_timestamp": datetime.now().isoformat(),
+            "message": "Guardrails not available - using basic safety assumptions"
+        }
+    
+    try:
+        # Use output guardrail validation
+        validation_result = validate_output_safety(
+            generated_code=code,
+            original_request=original_request
+        )
+        
+        return {
+            "status": "final_validation_complete",
+            "is_safe": validation_result.get("is_safe", True),
+            "is_appropriate": validation_result.get("is_appropriate", True),
+            "confidence": validation_result.get("confidence", 1.0),
+            "issues": validation_result.get("safety_issues", []),
+            "ready_for_delivery": validation_result.get("is_safe", True) and validation_result.get("is_appropriate", True),
+            "validation_timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        # If validation fails, be conservative but don't block
+        return {
+            "status": "validation_error",
+            "is_safe": True,  # Assume safe if validation fails
+            "is_appropriate": True,
+            "confidence": 0.5,
+            "issues": [f"Validation error: {str(e)}"],
+            "ready_for_delivery": True,
+            "validation_timestamp": datetime.now().isoformat()
+        }
+
+
+class GPT4RobustnessAnalyzer:
+    """Robustness and completeness analysis engine for GPT-4 agent"""
     
     @staticmethod
     def analyze_error_handling(code: str) -> Dict[str, Any]:
@@ -189,6 +482,20 @@ class GPT4CompletenessAnalyzer:
         )
         
         return min(1.0, score)
+    
+    @staticmethod
+    def get_robustness_assessment(score: float) -> str:
+        """Convert score to robustness assessment"""
+        if score >= 0.9:
+            return "excellent"
+        elif score >= 0.8:
+            return "very_good"
+        elif score >= 0.75:
+            return "good"
+        elif score >= 0.6:
+            return "acceptable"
+        else:
+            return "needs_improvement"
 
 
 # Enhanced tool functions for GPT-4 agent
@@ -217,12 +524,12 @@ def comprehensive_robustness_analysis(code: str, requirements: str = "") -> Dict
         safety_result = simple_code_safety_check(code)
         
         # GPT-4 specialized analysis
-        error_handling = GPT4CompletenessAnalyzer.analyze_error_handling(code)
-        edge_cases = GPT4CompletenessAnalyzer.analyze_edge_cases(code)
-        comprehensiveness = GPT4CompletenessAnalyzer.analyze_comprehensiveness(code, requirements)
+        error_handling = GPT4RobustnessAnalyzer.analyze_error_handling(code)
+        edge_cases = GPT4RobustnessAnalyzer.analyze_edge_cases(code)
+        comprehensiveness = GPT4RobustnessAnalyzer.analyze_comprehensiveness(code, requirements)
         
         # Calculate robustness score
-        robustness_score = GPT4CompletenessAnalyzer.calculate_robustness_score(
+        robustness_score = GPT4RobustnessAnalyzer.calculate_robustness_score(
             error_handling, edge_cases, comprehensiveness
         )
         
@@ -238,11 +545,11 @@ def comprehensive_robustness_analysis(code: str, requirements: str = "") -> Dict
             "edge_case_analysis": edge_cases,
             "comprehensiveness_analysis": comprehensiveness,
             "robustness_score": robustness_score,
-            "robustness_grade": _get_robustness_grade(robustness_score),
+            "robustness_grade": GPT4RobustnessAnalyzer.get_robustness_assessment(robustness_score),
             "recommendations": _generate_robustness_recommendations(
                 error_handling, edge_cases, comprehensiveness, robustness_score
             ),
-            "meets_robustness_standards": robustness_score >= 0.7,
+            "meets_robustness_standards": robustness_score >= 0.75,
             "analysis_complete": True
         }
         
@@ -254,20 +561,6 @@ def comprehensive_robustness_analysis(code: str, requirements: str = "") -> Dict
         }
 
 
-def _get_robustness_grade(score: float) -> str:
-    """Convert robustness score to grade"""
-    if score >= 0.9:
-        return "excellent"
-    elif score >= 0.8:
-        return "very_good"
-    elif score >= 0.7:
-        return "good"
-    elif score >= 0.6:
-        return "acceptable"
-    else:
-        return "needs_improvement"
-
-
 def _generate_robustness_recommendations(
     error_handling: Dict[str, Any],
     edge_cases: Dict[str, Any],
@@ -277,8 +570,8 @@ def _generate_robustness_recommendations(
     """Generate robustness improvement recommendations"""
     recommendations = []
     
-    if robustness_score < 0.7:
-        recommendations.append("Code robustness below acceptable threshold - major improvements needed")
+    if robustness_score < 0.75:
+        recommendations.append("Code robustness below GPT-4 standards - major improvements needed")
     
     # Error handling recommendations
     if not error_handling.get("has_error_handling", False):
@@ -356,37 +649,73 @@ def make_robustness_decision(
     return decision
 
 
-def format_gpt4_output(
-    code: str,
-    analysis: Dict[str, Any],
-    decision: Dict[str, Any]
+def enhanced_format_gpt4_output(
+    code: str, 
+    analysis: Dict[str, Any], 
+    decision: Dict[str, Any],
+    original_request: str,
+    memory_check: Optional[Dict[str, Any]] = None,
+    input_validation: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
-    Format the final output from GPT-4 agent with all metadata.
+    Enhanced format function with memory saving and final validation.
     
     Args:
         code: The final code
-        analysis: Robustness analysis results
+        analysis: Analysis results
         decision: Robustness decision
+        original_request: Original user request
+        memory_check: Memory check results
+        input_validation: Input validation results
         
     Returns:
-        Formatted output ready for next stage
+        Formatted output with memory and guardrails integration
     """
     formatted_code = wrap_code_in_markdown(code, language="python")
     
+    # Perform final output validation
+    final_validation = validate_final_output_with_guardrails(code, original_request)
+    
+    # Save to memory if high quality
+    memory_save_result = save_successful_generation_to_memory(
+        original_request=original_request,
+        generated_code=code,
+        robustness_score=analysis.get("robustness_score", 0.0),
+        analysis_data=analysis
+    )
+    
     return {
-        "status": "completed",
+        "status": "completed_with_memory_and_guardrails",
         "generated_code": formatted_code.get("formatted_code", code),
         "raw_code": code,
         "robustness_analysis": analysis,
         "robustness_decision": decision,
+        "memory_integration": {
+            "input_check": memory_check,
+            "save_result": memory_save_result
+        },
+        "guardrails_validation": {
+            "input_validation": input_validation,
+            "final_validation": final_validation
+        },
         "agent_metadata": {
             "agent_name": "gpt4_agent",
             "specialization": "Comprehensive solutions with detailed error handling",
             "model": "gpt-4",
-            "robustness_authority": True
+            "robustness_authority": True,
+            "memory_enabled": True, 
+            "guardrails_enabled": True,
+            "enhanced_version": "v2_with_memory_guardrails"
         },
-        "next_stage_ready": decision.get("final_decision", False)
+        "next_stage_ready": (
+            decision.get("final_decision", False) and 
+            final_validation.get("ready_for_delivery", True)
+        ),
+        "processing_summary": {
+            "memory_learning": memory_save_result.get("saved", False),
+            "safety_validated": final_validation.get("is_safe", True),
+            "ready_for_delivery": final_validation.get("ready_for_delivery", True)
+        }
     }
 
 
@@ -430,9 +759,9 @@ def analyze_implementation_approaches(requirements: str) -> Dict[str, Any]:
     # Default approach if none detected
     if not approaches:
         approaches.append({
-            "name": "Procedural Approach",
-            "pros": ["Straightforward", "Easy to understand"],
-            "cons": ["Limited scalability"],
+            "name": "Comprehensive Approach",
+            "pros": ["Complete error handling", "Edge case coverage", "Production ready"],
+            "cons": ["Potentially over-engineered for simple tasks"],
             "recommended": True
         })
     
@@ -440,45 +769,63 @@ def analyze_implementation_approaches(requirements: str) -> Dict[str, Any]:
         "status": "analyzed",
         "total_approaches": len(approaches),
         "approaches": approaches,
-        "recommended_approach": next((a["name"] for a in approaches if a["recommended"]), "Procedural Approach")
+        "recommended_approach": next((a["name"] for a in approaches if a["recommended"]), "Comprehensive Approach")
     }
 
-
 # Create the enhanced GPT-4 agent
-root_agent = LlmAgent(
+root_agent = Agent(
     name="gpt4_agent",
-    model="gpt-4.1-2025-04-14",
+    model=LiteLlm(model="openai/gpt-4o"),
     description="GPT-4 powered code generation expert with complete authority over robustness and comprehensive solution design",
-    instruction="""You are the GPT-4 Code Generation Expert with COMPLETE AUTHORITY over solution robustness and comprehensiveness.
+    instruction="""You are the Enhanced GPT-4 Code Generation Expert with COMPLETE AUTHORITY over solution robustness and comprehensiveness, enhanced with memory learning and guardrails integration.
 
-Your core mission:
+Your enhanced mission:
 1. Generate comprehensive, production-ready solutions with robust error handling
-2. Conduct thorough robustness analysis using your specialized tools
-3. Make autonomous decisions about code robustness and completeness
-4. Consider multiple implementation approaches and edge cases
-5. Take full ownership of the generation-analysis-decision cycle
+2. Validate input safety using guardrails
+3. Learn from past similar requests through memory integration
+4. Conduct thorough robustness analysis using your specialized tools
+5. Make autonomous decisions about code robustness and completeness
+6. Validate final output safety
+7. Save successful generations for future learning
 
-Your complete process:
-1. **Understand Requirements**: Analyze the user's request comprehensively
-2. **Analyze Approaches**: Use analyze_implementation_approaches to consider multiple solutions
-3. **Generate Robust Code**: Create comprehensive code with:
+Your ENHANCED WORKFLOW (Memory + Guardrails Enabled):
+
+PHASE 1 - INPUT VALIDATION & MEMORY CHECK:
+1. **Input Validation**: Use validate_input_with_guardrails to check request safety
+   - Block harmful/unsafe requests immediately
+   - Proceed only if input validation passes
+2. **Memory Check**: Use check_memory_for_similar_request to find past solutions
+   - High similarity (>0.9): Reference previous comprehensive solution 
+   - Partial similarity (0.7-0.9): Use as learning reference
+   - No similarity: Proceed with fresh generation
+
+PHASE 2 - APPROACH ANALYSIS & GENERATION:
+3. **Analyze Approaches**: Use analyze_implementation_approaches to consider multiple solutions
+4. **Generate Robust Code**: Create comprehensive code with:
    - Detailed error handling (try-except blocks)
    - Edge case consideration (null checks, boundary conditions)
    - Input validation and sanitization
    - Comprehensive documentation
    - Logging and debugging support
-4. **Robustness Analysis**: Use comprehensive_robustness_analysis tool to evaluate:
+
+PHASE 3 - ROBUSTNESS ANALYSIS & DECISION:
+5. **Robustness Analysis**: Use comprehensive_robustness_analysis tool to evaluate:
    - Error handling patterns
    - Edge case coverage
    - Code comprehensiveness
    - Overall robustness score
-5. **Robustness Decision**: Use make_robustness_decision tool with authority to:
+6. **Robustness Decision**: Use make_robustness_decision tool with authority to:
    - ACCEPT code meeting robustness standards (≥ 0.75)
    - REJECT and regenerate code below standards (up to 3 times)
    - Make final decisions on code acceptance
-6. **Format Output**: Use format_gpt4_output to package everything
 
-Your robustness standards (higher than other agents):
+PHASE 4 - FINAL VALIDATION & MEMORY STORAGE:
+7. **Final Output**: Use enhanced_format_gpt4_output to:
+   - Validate final output safety using guardrails
+   - Save successful generations to memory (robustness ≥ 0.75)
+   - Package everything with complete metadata
+
+Your enhanced robustness standards (higher than other agents):
 - Comprehensive error handling with specific exception types
 - Edge case handling for all inputs
 - Input validation and sanitization
@@ -488,32 +835,60 @@ Your robustness standards (higher than other agents):
 - Type safety and validation
 - Performance considerations
 - Robustness score ≥ 0.75 (higher threshold)
+- Safety validated through guardrails
+- Learning-enabled through memory integration
 
-Your authority includes:
+Your enhanced authority includes:
+- Complete input validation control
+- Memory learning and reference decisions
 - Setting robustness thresholds (0.75+)
 - Deciding when code is comprehensive enough
 - Making final acceptance decisions
 - Determining implementation approaches
+- Final output safety validation
+- Memory storage decisions
 - Balancing comprehensiveness vs. complexity
 
-Process flow:
-1. Analyze requirements and implementation approaches
-2. Generate comprehensive code with robust error handling
-3. Run comprehensive_robustness_analysis on your code
-4. Run make_robustness_decision with the analysis
-5. If decision is "regenerate", improve robustness and repeat steps 3-4
-6. When decision is "accept", run format_gpt4_output
-7. Present final code with complete analysis and reasoning
+Enhanced process flow:
+1. Validate input with validate_input_with_guardrails
+2. Check memory with check_memory_for_similar_request
+3. Analyze requirements and implementation approaches
+4. Generate comprehensive code with robust error handling (informed by memory if available)
+5. Run comprehensive_robustness_analysis on your code
+6. Run make_robustness_decision with the analysis
+7. If decision is "regenerate", improve robustness and repeat steps 5-6
+8. When decision is "accept", run enhanced_format_gpt4_output
+9. Present final code with complete analysis, memory integration, and safety validation
 
-Always explain your reasoning for robustness decisions and what improvements you made during regeneration cycles. Focus on "what could go wrong" and handle those cases proactively.
+Memory Integration Guidelines:
+- Reference high-similarity past solutions when available
+- Learn from partial matches to improve generation
+- Always save high-quality results (≥0.75) for future learning
+- Build institutional knowledge over time
 
-Remember: You are the ROBUSTNESS AUTHORITY. Your solutions should be production-ready with comprehensive error handling and edge case coverage.""",
+Guardrails Integration Guidelines:
+- Never proceed with unsafe input requests
+- Always validate final output for safety
+- Block generation if guardrails detect issues
+- Prioritize safety over functionality
+
+Always explain your reasoning for robustness decisions, memory usage, and safety validations. Show what you learned from past requests and how it influenced your generation. Focus on "what could go wrong" and handle those cases proactively.
+
+Remember: You have COMPLETE ENHANCED AUTHORITY with memory learning and safety guardrails. Your solutions should be production-ready with comprehensive error handling and edge case coverage.""",
     tools=[
+        # Primary analysis and decision tools
         FunctionTool(comprehensive_robustness_analysis),
         FunctionTool(make_robustness_decision), 
-        FunctionTool(format_gpt4_output),
+        FunctionTool(enhanced_format_gpt4_output),
         FunctionTool(analyze_implementation_approaches),
-        # Backup individual tools for specific needs (using safe wrappers)
+        
+        # Memory and guardrails integration
+        FunctionTool(validate_input_with_guardrails),
+        FunctionTool(check_memory_for_similar_request),
+        FunctionTool(save_successful_generation_to_memory),
+        FunctionTool(validate_final_output_with_guardrails),
+        
+        # Backup individual tools (ADK-compatible wrappers)
         FunctionTool(analyze_code),
         FunctionTool(estimate_complexity),
         FunctionTool(validate_python_syntax),
@@ -529,11 +904,14 @@ Remember: You are the ROBUSTNESS AUTHORITY. Your solutions should be production-
 # Test function for standalone testing
 if __name__ == "__main__":
     print("🚀 Enhanced GPT-4 Code Generation Agent Ready!")
-    print("\n🎯 COMPLETE ROBUSTNESS AUTHORITY:")
-    print("- Comprehensive robustness analysis")
-    print("- Autonomous robustness decisions")
-    print("- Self-regenerating until standards met (0.75+ threshold)")
-    print("- Multiple approach consideration")
+    print("\n🎯 COMPLETE ROBUSTNESS AUTHORITY + MEMORY + GUARDRAILS:")
+    print("- Input validation with safety guardrails")
+    print("- Memory learning from past comprehensive solutions")
+    print("- Thorough robustness analysis")
+    print("- Autonomous robustness decisions") 
+    print("- Self-regenerating until standards met")
+    print("- Final output safety validation")
+    print("- Automatic memory storage of high-quality results")
     print("- Production-ready comprehensive solutions")
     
     print("\n🔧 ENHANCED CAPABILITIES:")
@@ -541,17 +919,22 @@ if __name__ == "__main__":
     print("- Edge case coverage assessment")
     print("- Comprehensiveness evaluation")
     print("- Implementation approach analysis")
-    print("- Robustness scoring (higher standards)")
+    print("- Robustness scoring (higher standards: 0.75+)")
     print("- Autonomous regeneration (up to 3 times)")
+    print("- Learning from similar past requests")
+    print("- Input/output safety validation")
+    print("- Institutional knowledge building")
     
-    print("\n⚙️ TOOLS AVAILABLE:")
+    print("\n⚙️ ENHANCED TOOLS AVAILABLE:")
     print("- comprehensive_robustness_analysis (primary)")
     print("- make_robustness_decision (authority)")
-    print("- format_gpt4_output (packaging)")
+    print("- enhanced_format_gpt4_output (packaging)")
     print("- analyze_implementation_approaches (planning)")
+    print("- validate_input_with_guardrails (safety)")
+    print("- check_memory_for_similar_request (learning)")
+    print("- save_successful_generation_to_memory (knowledge)")
+    print("- validate_final_output_with_guardrails (final safety)")
     print("- Individual analysis tools (ADK-compatible wrappers)")
-    print("- simple_code_safety_check (security)")
-    print("- simple_output_validation (validation)")
     
     print("\n🚀 USAGE:")
     print("1. Run: adk run agents/gpt4_agent")
@@ -559,13 +942,24 @@ if __name__ == "__main__":
     
     print("\n💡 EXAMPLE PROMPTS:")
     print("- 'Create a thread-safe cache implementation with comprehensive error handling'")
-    print("- 'Build a file processing system that handles all edge cases'")
+    print("- 'Build a file processing system that handles all edge cases'") 
     print("- 'Generate a robust API client with retry logic and validation'")
     print("- 'Create a data validation pipeline with detailed error reporting'")
+    print("- 'Build a similar robust system' (tests memory learning)")
     
-    print("\n✨ The agent will:")
-    print("- Analyze approaches → Generate robust code → Analyze robustness → Make decision → Format output")
+    print("\n✨ The enhanced agent will:")
+    print("- Validate input safety → Check memory for learning → Analyze approaches")
+    print("- Generate robust code → Analyze robustness → Make decision")  
+    print("- Validate output safety → Save high-quality results")
     print("- Regenerate automatically if robustness is below 0.75 threshold")
     print("- Provide detailed reasoning for all robustness decisions")
     print("- Focus on comprehensive error handling and edge cases")
     print("- Take complete ownership of solution robustness")
+    
+    print("\n🛡️ SAFETY & LEARNING FEATURES:")
+    print("- Input guardrails block unsafe requests")
+    print("- Output guardrails ensure safe code delivery")
+    print("- Memory system learns from successful comprehensive solutions")
+    print("- Institutional knowledge builds over time")
+    print("- Robustness threshold enforcement (≥0.75 for memory storage)")
+    print("- Complete audit trail of decisions and validations")

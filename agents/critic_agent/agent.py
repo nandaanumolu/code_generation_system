@@ -866,14 +866,14 @@ def make_review_decision(
 
 
 def enhanced_format_critic_output(
-    review_analysis: Dict[str, Any],
-    structured_feedback: Dict[str, Any],
-    review_decision: Dict[str, Any],
-    original_code: str,
-    source_agent: str,
-    memory_check: Dict[str, Any],
-    input_validation: Dict[str, Any]
-) -> Dict[str, Any]:
+    review_analysis ,
+    structured_feedback ,
+    review_decision,
+    original_code,
+    source_agent,
+    memory_check,
+    input_validation
+) :
     """
     Enhanced format function with memory saving and final validation.
     Now with robust type checking to handle LLM mistakes.
@@ -1084,7 +1084,7 @@ Review dimensions:
         FunctionTool(comprehensive_code_review),
         FunctionTool(generate_structured_feedback),
         FunctionTool(make_review_decision),
-        FunctionTool(enhanced_format_critic_output),
+        # FunctionTool(enhanced_format_critic_output),
         FunctionTool(validate_review_input_with_guardrails),
         FunctionTool(check_memory_for_similar_reviews),
         FunctionTool(save_successful_review_to_memory),

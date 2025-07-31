@@ -888,17 +888,17 @@ def format_refactored_output(
     # Calculate success metrics
     success_metrics = {
         "quality_improvement": 0.8,  # Example metric
-        "functionality_preserved": refactor_summary.get("quality_improvements", {}).get("functionality_preserved", True),
-        "techniques_used": refactor_summary.get("code_changes", {}).get("techniques_used", [])
+        "functionality_preserved": refactor_summary,
+        "techniques_used": refactor_summary
     }
     
     # Save successful pattern to memory if quality is high
     if success_metrics["quality_improvement"] >= 0.7:
         memory_save = save_successful_refactoring_to_memory(
-            original_code=refactor_summary.get("code_changes", {}).get("original_code", ""),
+            original_code=refactor_summary,
             refactored_code=refactored_code,
-            issues_addressed=refactor_summary.get("code_changes", {}).get("changes_made", []),
-            refactor_approach=refactor_summary.get("quality_improvements", {}).get("focus_area", ""),
+            issues_addressed=refactor_summary,
+            refactor_approach=refactor_summary,
             success_metrics=success_metrics
         )
     else:

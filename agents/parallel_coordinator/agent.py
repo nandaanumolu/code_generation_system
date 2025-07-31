@@ -208,9 +208,9 @@ Output the code directly without any formatting functions.""",
 # Import all agents safely
 gemini_agent, GEMINI_AVAILABLE = UltraSafeAgentImporter.import_agent("gemini_agent", "gemini_agent.agent")
 gpt4_agent, GPT4_AVAILABLE = UltraSafeAgentImporter.import_agent("gpt4_agent", "gpt4_agent.agent")
-##################################################
+##############################################################################################################
 #claude_agent, CLAUDE_AVAILABLE = UltraSafeAgentImporter.import_agent("claude_agent", "claude_gen_agent.agent")
-##################################################
+##############################################################################################################
 
 # --- SAFE IMPORTS WITH COMPREHENSIVE FALLBACKS ---
 
@@ -787,10 +787,10 @@ if gemini_agent:
 if gpt4_agent:
     available_agents.append(gpt4_agent)
 
-############################################
-# if claude_agent:
-#     available_agents.append(claude_agent)
-############################################
+###################################################
+#if claude_agent:
+#    available_agents.append(claude_agent)
+###################################################
 
 if available_agents:
     parallel_generation_agent = ParallelAgent(

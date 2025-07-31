@@ -59,6 +59,16 @@ except ImportError as e:
     delivery_agent = None
     DELIVERY_AVAILABLE = False
 
+# Import mcp agent if available
+try:
+    from mcp_agent.agent import root_agent as mcp_agent
+    print("✅ mcp Agent imported successfully")
+    FILE_SYSTEM_AVAILABLE = True
+except ImportError as e:
+    print("⚠️ Delivery Agent not available - will create basic version")
+    mcp_agent = None
+    FILE_SYSTEM_AVAILABLE = False
+
 # Import guardrails
 try:
     from shared.guardrails.input_guardrail import validate_input_request
@@ -516,7 +526,7 @@ if PARALLEL_AVAILABLE and parallel_coordinator:
 else:
     print("⚠️ Parallel coordinator not available")
 
-orchestration_agents.append(preparation_agent)
+#orchestration_agents.append(preparation_agent)
 
 if REVIEW_LOOP_AVAILABLE and review_loop_agent:
     orchestration_agents.append(review_loop_agent)
@@ -528,10 +538,18 @@ orchestration_agents.append(output_validation_agent)
 if DELIVERY_AVAILABLE and delivery_agent:
     orchestration_agents.append(delivery_agent)
 
+if FILE_SYSTEM_AVAILABLE and mcp_agent:
+    orchestration_agents.append(mcp_agent)
+
 # Create the main orchestrator
 root_agent = SequentialAgent(
     name="main_orchestrator",
-    description="Main orchestrator coordinating the entire code generation workflow",
+    description="Your task will be executed by a multi-agent system. First, a Parallel Coordinator Agent will orchestrate" \
+    " multiple expert agents—Gemini, GPT, and Claude—to independently generate code solutions for the given task in parallel. " \
+    "Each agent must save its generated code files in its designated folder (e.g., /gemini/, /gpt/, /claude/). " \
+    "Once code files are generated and stored in their respective folders, the outputs from all agents will be collected and " \
+    "passed to a Review Loop Agent, which will iteratively evaluate, refine, and consolidate the code until a " \
+    "final, high-quality solution is reached. After the Review Loop Agent finalizes the code, the completed solution will be presented to the user.",
     sub_agents=orchestration_agents
 )
 

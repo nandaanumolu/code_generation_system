@@ -1,1196 +1,316 @@
+# agents/review_loop_agent/agent.py
 """
-Enhanced Critic Agent - Production Ready with Memory & Guardrails
-Specializes in comprehensive code review and analysis from all generation agents
+Review-Refactor Loop Agent using ADK's LoopAgent
+Orchestrates iterative code improvement through review and refactoring cycles
 
-Features:
-- Comprehensive multi-dimensional code review
-- Reviews code from Gemini, GPT-4, and Claude agents with understanding of their specialties
-- Memory learning from past review patterns and successful critiques
-- Input/output safety validation through guardrails  
-- Structured feedback with severity classification
-- Institutional knowledge building for better reviews over time
-- ULTRA-ROBUST error handling for all edge cases
-
-Note: Uses simplified wrapper functions for complex shared tools to ensure
-ADK compatibility with automatic function calling.
+This agent:
+1. Takes initial code as input
+2. Runs critic agent to review the code
+3. Runs refactor agent to fix identified issues
+4. Loops until code quality meets standards or max iterations reached
 """
 
-from google.adk.agents import Agent
+from google.adk.agents import Agent, LoopAgent
+from google.adk.agents.llm_agent import LlmAgent
 from google.adk.models.lite_llm import LiteLlm
 from google.adk.tools import FunctionTool
 from google.adk.events import Event, EventActions
 from google.adk.agents.invocation_context import InvocationContext
-from typing import AsyncGenerator, Dict, Any, Optional, List
-from datetime import datetime
+from typing import AsyncGenerator, Dict, Any, List, Optional
 import sys
 from pathlib import Path
-import re
 import json
+import re
 
-import os
-os.environ["OTEL_SDK_DISABLED"] = "true"
-os.environ["OPENTELEMETRY_SUPPRESS_INSTRUMENTATION"] = "true"
-
-# Add shared to path for imports
+# Add parent directories to path for imports
+sys.path.append(str(Path(__file__).parent.parent))
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
-# Import all our shared tools
+# Import the critic and refactor agents
+try:
+    # Import critic agent
+    from critic_agent.agent import root_agent as critic_agent_instance
+    print("✓ Successfully imported critic agent")
+except ImportError as e:
+    print(f"Error importing critic agent: {e}")
+    critic_agent_instance = None
+
+try:
+    # Import refactor agent (adjust the import path based on your folder structure)
+    from refactor_agent.agent import root_agent as refactor_agent_instance
+    print("✓ Successfully imported refactor agent")
+except ImportError as e:
+    print(f"Error importing refactor agent: {e}")
+    refactor_agent_instance = None
+
+# Import shared tools
 from shared.tools import (
     analyze_code,
     wrap_code_in_markdown,
-    add_line_numbers,
-    extract_functions,
-    estimate_complexity,
-    validate_python_syntax,
-    format_code_output,
-    clean_code_string
+    clean_code_string,
+    format_code_output
 )
 
-from shared.guardrails import (
-    validate_output_code,
-    check_code_safety
-)
 
-# Import memory and guardrails services (with fallbacks)
-try:
-    from shared.memory import get_memory_service, MemoryEntry
-    MEMORY_AVAILABLE = True
-except ImportError:
-    print("Warning: Memory service not available - using fallback")
-    MEMORY_AVAILABLE = False
-    
-    # Fallback MemoryEntry class
-    class MemoryEntry:
-        def __init__(self, **kwargs):
-            for key, value in kwargs.items():
-                setattr(self, key, value)
-    
-try:
-    from shared.guardrails.input_guardrail import validate_input_request
-    from shared.guardrails.output_guardrail import validate_output_safety
-    GUARDRAILS_AVAILABLE = True
-except ImportError:
-    print("Warning: Guardrails not available - using fallback")
-    GUARDRAILS_AVAILABLE = False
-
-# Simple wrapper functions for ADK compatibility
-def simple_code_safety_check(code: str) -> Dict[str, Any]:
+def prepare_code_for_review(code: str) -> Dict[str, Any]:
     """
-    Simplified wrapper for check_code_safety that uses basic types.
+    Prepare code for the review-refactor loop.
     
     Args:
-        code: Code to check for safety
+        code: The code to be reviewed and refactored
         
     Returns:
-        Safety check results
+        Prepared context for the loop
     """
-    try:
-        # Call the actual function with default language
-        result = check_code_safety(code, language="python")
-        return {
-            "is_safe": result.get("is_safe", True),
-            "issues": result.get("issues", []),
-            "status": "checked"
-        }
-    except Exception as e:
-        return {
-            "is_safe": True,
-            "issues": [],
-            "status": "error",
-            "error": str(e)
-        }
+    cleaned_code = clean_code_string(code)
+    return {
+        "status": "prepared",
+        "original_code": code,
+        "cleaned_code": cleaned_code,
+        "ready_for_loop": True
+    }
 
-def simple_output_validation(code: str) -> Dict[str, Any]:
+
+def extract_review_results(critic_output: str) -> Dict[str, Any]:
     """
-    Simplified wrapper for validate_output_code.
+    Extract structured review results from critic agent output.
     
     Args:
-        code: Code to validate
+        critic_output: Raw output from critic agent
         
     Returns:
-        Validation results
+        Structured review results
     """
     try:
-        result = validate_output_code(code)
-        return {
-            "is_valid": result.get("is_valid", True),
-            "validation_passed": result.get("validation_passed", True),
-            "status": "validated"
-        }
-    except Exception as e:
-        return {
-            "is_valid": True,
-            "validation_passed": True,
-            "status": "error",
-            "error": str(e)
-        }
-
-
-# MEMORY AND GUARDRAILS FUNCTIONS
-
-def validate_review_input_with_guardrails(code_to_review: str, review_request: str = "") -> Dict[str, Any]:
-    """
-    Validate code review input using guardrails.
-    
-    Args:
-        code_to_review: The code that needs to be reviewed
-        review_request: Optional specific review request
-        
-    Returns:
-        Validation results with safety status
-    """
-    if not GUARDRAILS_AVAILABLE:
-        return {
-            "status": "fallback_validation",
-            "is_safe": True,
-            "is_valid": True,
-            "confidence": 0.8,
-            "issues": [],
-            "blocked": False,
-            "timestamp": datetime.now().isoformat(),
-            "message": "Guardrails not available - using basic validation"
-        }
-    
-    try:
-        # Combine code and request for validation
-        combined_input = f"Review request: {review_request}\nCode to review:\n{code_to_review}"
-        validation_result = validate_input_request(combined_input)
-        
-        return {
-            "status": "validated",
-            "is_safe": validation_result.get("is_safe", True),
-            "is_valid": validation_result.get("is_valid", True),
-            "confidence": validation_result.get("confidence", 1.0),
-            "issues": validation_result.get("issues", []),
-            "blocked": not validation_result.get("is_safe", True),
-            "timestamp": datetime.now().isoformat()
-        }
-    except Exception as e:
-        return {
-            "status": "error",
-            "is_safe": True,
-            "is_valid": True,
-            "confidence": 0.5,
-            "issues": [f"Guardrail error: {str(e)}"],
-            "blocked": False,
-            "timestamp": datetime.now().isoformat()
-        }
-
-
-def check_memory_for_similar_reviews(code_to_review: str, source_agent: str = "") -> Dict[str, Any]:
-    """
-    Check memory for similar past code reviews to enable learning.
-    
-    Args:
-        code_to_review: Current code to review
-        source_agent: Which agent generated the code (gemini, gpt4, claude)
-        
-    Returns:
-        Memory search results with similar reviews
-    """
-    if not MEMORY_AVAILABLE:
-        return {
-            "status": "memory_not_available",
-            "found_similar": False,
-            "message": "Memory service not available - proceeding with fresh review",
-            "should_proceed": True
-        }
-    
-    try:
-        memory_service = get_memory_service()
-        
-        # Search for similar past reviews
-        similar_memories = memory_service.search_similar(
-            request=code_to_review,
-            category="critic_code_reviews", 
-            threshold=0.6  # Lower threshold for code similarity
-        )
-        
-        if not similar_memories:
-            return {
-                "status": "no_matches",
-                "found_similar": False,
-                "message": "No similar reviews found in memory",
-                "should_proceed": True
-            }
-        
-        # Get the best match
-        best_match = similar_memories[0]
-        similarity_score = best_match.data.get("similarity_score", 0)
-        
-        # High similarity suggests learning from past review
-        if similarity_score > 0.8:
-            return {
-                "status": "high_similarity_found",
-                "found_similar": True,
-                "similarity_score": similarity_score,
-                "previous_code": best_match.data.get("reviewed_code", "")[:200] + "...",
-                "previous_review_quality": best_match.quality_score,
-                "previous_issues_found": best_match.data.get("issues_count", 0),
-                "previous_severity_breakdown": best_match.data.get("severity_breakdown", {}),
-                "recommendation": "Learn from previous similar review patterns",
-                "should_proceed": True,
-                "can_reference": True
-            }
-        else:
-            return {
-                "status": "partial_similarity_found", 
-                "found_similar": True,
-                "similarity_score": similarity_score,
-                "previous_review_quality": best_match.quality_score,
-                "recommendation": "Some related review experience found - use as reference",
-                "should_proceed": True,
-                "can_reference": False
-            }
+        # Try to parse as JSON first
+        if "{" in critic_output and "}" in critic_output:
+            # Extract JSON from the output
+            json_start = critic_output.find("{")
+            json_end = critic_output.rfind("}") + 1
+            json_str = critic_output[json_start:json_end]
+            result = json.loads(json_str)
             
-    except Exception as e:
-        return {
-            "status": "memory_error",
-            "found_similar": False,
-            "error": str(e),
-            "should_proceed": True,
-            "message": "Memory check failed, proceeding with fresh review"
-        }
-
-
-def save_successful_review_to_memory(
-    reviewed_code: str,
-    review_analysis: Dict[str, Any],
-    source_agent: str,
-    review_quality_score: float
-) -> Dict[str, Any]:
-    """
-    Save successful code review to memory for future learning.
-    
-    Args:
-        reviewed_code: The code that was reviewed
-        review_analysis: Complete review analysis results
-        source_agent: Which agent generated the code
-        review_quality_score: Quality score of the review process
-        
-    Returns:
-        Memory save confirmation
-    """
-    if not MEMORY_AVAILABLE:
-        return {
-            "status": "memory_not_available",
-            "reason": "Memory service not available",
-            "saved": False,
-            "message": "Review completed successfully but not saved to memory"
-        }
-    
-    try:
-        # Only save high-quality reviews
-        if review_quality_score < 0.7:
+            # Extract key metrics
             return {
-                "status": "not_saved",
-                "reason": f"Review quality score {review_quality_score:.2f} below threshold (0.7)",
-                "saved": False
+                "has_critical_issues": result.get("review_decision", {}).get("blocking", False),
+                "severity_counts": result.get("structured_feedback", {}).get("severity_breakdown", {}),
+                "quality_score": result.get("review_analysis", {}).get("overall_quality_score", 0.0),
+                "issues": result.get("review_analysis", {}).get("all_issues", []),
+                "recommendations": result.get("structured_feedback", {}).get("structured_recommendations", [])
             }
-        
-        memory_service = get_memory_service()
-        
-        # Create memory entry
-        memory_entry = MemoryEntry(
-            category="critic_code_reviews",
-            agent_name="critic_agent",
-            data={
-                "reviewed_code": reviewed_code,
-                "source_agent": source_agent,
-                "review_quality_score": review_quality_score,
-                "issues_count": review_analysis.get("total_issues", 0),
-                "severity_breakdown": review_analysis.get("severity_counts", {}),
-                "review_summary": {
-                    "correctness_score": review_analysis.get("correctness_analysis", {}).get("correctness_score", 0),
-                    "security_score": review_analysis.get("security_analysis", {}).get("security_score", 0),
-                    "performance_score": review_analysis.get("performance_analysis", {}).get("performance_score", 0),
-                    "maintainability_score": review_analysis.get("maintainability_analysis", {}).get("maintainability_score", 0),
-                    "overall_code_quality": review_analysis.get("overall_quality_score", 0)
-                },
-                "review_timestamp": datetime.now().isoformat(),
-                "agent_version": "enhanced_v1"
-            },
-            quality_score=review_quality_score,
-            tags=["critic", "comprehensive_review", "completed", source_agent]
-        )
-        
-        # Store in memory
-        memory_id = memory_service.store(memory_entry)
-        
-        return {
-            "status": "saved_successfully",
-            "memory_id": memory_id,
-            "review_quality_score": review_quality_score,
-            "saved": True,
-            "message": f"Comprehensive review saved to memory (score: {review_quality_score:.2f})"
-        }
-        
-    except Exception as e:
-        return {
-            "status": "save_error",
-            "error": str(e),
-            "saved": False,
-            "message": "Failed to save to memory, but review completed successfully"
-        }
-
-
-def validate_review_output_with_guardrails(
-    review_feedback: str,
-    original_code: str
-) -> Dict[str, Any]:
-    """
-    Final validation of review feedback using output guardrails.
+    except:
+        pass
     
-    Args:
-        review_feedback: Generated review feedback
-        original_code: Original code that was reviewed
-        
-    Returns:
-        Final validation results with safety assessment
-    """
-    if not GUARDRAILS_AVAILABLE:
-        return {
-            "status": "fallback_final_validation",
-            "is_safe": True,
-            "is_appropriate": True,
-            "confidence": 0.8,
-            "issues": [],
-            "ready_for_delivery": True,
-            "validation_timestamp": datetime.now().isoformat(),
-            "message": "Guardrails not available - using basic safety assumptions"
-        }
+    # Fallback: Parse text output
+    has_critical = bool(re.search(r'critical|CRITICAL|blocking|BLOCK', critic_output, re.IGNORECASE))
+    has_major = bool(re.search(r'major|MAJOR|significant', critic_output, re.IGNORECASE))
     
-    try:
-        # Use output guardrail validation
-        validation_result = validate_output_safety(
-            generated_code=review_feedback,
-            original_request=f"Code review of: {original_code[:200]}..."
-        )
-        
-        return {
-            "status": "final_validation_complete",
-            "is_safe": validation_result.get("is_safe", True),
-            "is_appropriate": validation_result.get("is_appropriate", True),
-            "confidence": validation_result.get("confidence", 1.0),
-            "issues": validation_result.get("safety_issues", []),
-            "ready_for_delivery": validation_result.get("is_safe", True) and validation_result.get("is_appropriate", True),
-            "validation_timestamp": datetime.now().isoformat()
-        }
-        
-    except Exception as e:
-        return {
-            "status": "validation_error",
-            "is_safe": True,
-            "is_appropriate": True,
-            "confidence": 0.5,
-            "issues": [f"Validation error: {str(e)}"],
-            "ready_for_delivery": True,
-            "validation_timestamp": datetime.now().isoformat()
-        }
-
-
-class CriticAnalysisEngine:
-    """Comprehensive code review and analysis engine for Critic agent"""
-    
-    @staticmethod
-    def analyze_correctness(code: str) -> Dict[str, Any]:
-        """Analyze code correctness and logic issues"""
-        issues = []
-        
-        # Basic syntax check
-        syntax_result = validate_python_syntax(code)
-        if not syntax_result.get("is_valid", True):
-            issues.extend([{"type": "syntax_error", "severity": "critical", "description": err} 
-                          for err in syntax_result.get("errors", [])])
-        
-        # Logic issue patterns
-        logic_patterns = {
-            "unreachable_code": len(re.findall(r'return.*\n.*\S', code)),
-            "infinite_loops": len(re.findall(r'while\s+True.*(?!\n.*break)', code, re.DOTALL)),
-            "unused_variables": len(re.findall(r'^\s*(\w+)\s*=.*(?!\n.*\1)', code, re.MULTILINE)),
-            "missing_return": len(re.findall(r'def\s+\w+\([^)]*\):(?:(?!\n\s*def|\n\s*class|\nclass|\ndef).)*?(?!\n.*return)', code, re.DOTALL))
-        }
-        
-        for pattern, count in logic_patterns.items():
-            if count > 0:
-                issues.append({
-                    "type": pattern,
-                    "severity": "major",
-                    "count": count,
-                    "description": f"Found {count} instances of {pattern.replace('_', ' ')}"
-                })
-        
-        correctness_score = max(0.0, 1.0 - (len(issues) * 0.1))
-        
-        return {
-            "correctness_score": correctness_score,
-            "syntax_valid": syntax_result.get("is_valid", True),
-            "logic_issues": issues,
-            "total_correctness_issues": len(issues),
-            "patterns_analyzed": logic_patterns
-        }
-    
-    @staticmethod
-    def analyze_security(code: str) -> Dict[str, Any]:
-        """Analyze security vulnerabilities and risks"""
-        security_issues = []
-        
-        # Security vulnerability patterns
-        security_patterns = {
-            "sql_injection": re.findall(r'execute\s*\(\s*[\'"].*%.*[\'"]|execute\s*\(\s*f[\'"]', code),
-            "eval_usage": re.findall(r'\beval\s*\(|\bexec\s*\(', code),
-            "shell_injection": re.findall(r'os\.system\s*\(|subprocess\.[^(]*\([^)]*shell\s*=\s*True', code),
-            "hardcoded_secrets": re.findall(r'password\s*=\s*[\'"][^\'"]+[\'"]|api_key\s*=\s*[\'"][^\'"]+[\'"]', code, re.IGNORECASE),
-            "unsafe_pickle": re.findall(r'pickle\.loads?\s*\(|cPickle\.loads?\s*\(', code),
-            "unsafe_yaml": re.findall(r'yaml\.load\s*\([^)]*(?!Loader)', code)
-        }
-        
-        for vuln_type, matches in security_patterns.items():
-            if matches:
-                security_issues.append({
-                    "type": vuln_type,
-                    "severity": "critical" if vuln_type in ["sql_injection", "eval_usage", "shell_injection"] else "major",
-                    "instances": len(matches),
-                    "examples": matches[:3],  # First 3 examples
-                    "description": f"Potential {vuln_type.replace('_', ' ')} vulnerability"
-                })
-        
-        # Security best practices check
-        has_input_validation = bool(re.search(r'\bvalidate\w*\(|\bcheck\w*\(|isinstance\s*\(', code))
-        has_error_handling = bool(re.search(r'\btry\s*:|except\s*\w*:', code))
-        
-        security_score = max(0.0, 1.0 - (len(security_issues) * 0.15))
-        if has_input_validation:
-            security_score += 0.1
-        if has_error_handling:
-            security_score += 0.1
-        security_score = min(1.0, security_score)
-        
-        return {
-            "security_score": security_score,
-            "security_issues": security_issues,
-            "total_security_issues": len(security_issues),
-            "has_input_validation": has_input_validation,
-            "has_error_handling": has_error_handling,
-            "patterns_checked": list(security_patterns.keys())
-        }
-    
-    @staticmethod
-    def analyze_performance(code: str) -> Dict[str, Any]:
-        """Analyze performance issues and optimization opportunities"""
-        performance_issues = []
-        
-        # Performance anti-patterns
-        perf_patterns = {
-            "nested_loops": len(re.findall(r'for\s+\w+.*:\s*.*for\s+\w+', code, re.DOTALL)),
-            "inefficient_string_concat": len(re.findall(r'\w+\s*\+=\s*[\'"]|\w+\s*=\s*\w+\s*\+\s*[\'"]', code)),
-            "global_variables": len(re.findall(r'^\s*global\s+\w+', code, re.MULTILINE)),
-            "repeated_calculations": len(re.findall(r'(\w+\([^)]*\)).*\1', code)),
-            "large_iterations": len(re.findall(r'for\s+\w+\s+in\s+range\s*\(\s*\d{4,}', code))
-        }
-        
-        for pattern, count in perf_patterns.items():
-            if count > 0:
-                severity = "major" if pattern in ["nested_loops", "large_iterations"] else "minor"
-                performance_issues.append({
-                    "type": pattern,
-                    "severity": severity,
-                    "count": count,
-                    "description": f"Found {count} instances of {pattern.replace('_', ' ')}"
-                })
-        
-        # Complexity analysis
-        complexity_data = estimate_complexity(code)
-        complexity_score = complexity_data.get("complexity", 0)
-        
-        if complexity_score > 15:
-            performance_issues.append({
-                "type": "high_complexity",
-                "severity": "major",
-                "value": complexity_score,
-                "description": f"Cyclomatic complexity ({complexity_score}) is high"
-            })
-        
-        performance_score = max(0.0, 1.0 - (len(performance_issues) * 0.1))
-        
-        return {
-            "performance_score": performance_score,
-            "performance_issues": performance_issues,
-            "total_performance_issues": len(performance_issues),
-            "complexity_score": complexity_score,
-            "patterns_analyzed": perf_patterns
-        }
-    
-    @staticmethod
-    def analyze_maintainability(code: str) -> Dict[str, Any]:
-        """Analyze code maintainability and best practices"""
-        maintainability_issues = []
-        
-        # Get basic metrics
-        metrics = analyze_code(code)
-        
-        # Maintainability checks
-        has_docstrings = metrics.get("has_docstrings", False)
-        has_functions = metrics.get("has_functions", False)
-        has_classes = metrics.get("has_classes", False)
-        line_count = metrics.get("lines_non_empty", 0)
-        
-        # Code organization issues
-        if not has_docstrings and (has_functions or has_classes):
-            maintainability_issues.append({
-                "type": "missing_documentation",
-                "severity": "major",
-                "description": "Functions/classes lack docstrings"
-            })
-        
-        if line_count > 50 and not (has_functions or has_classes):
-            maintainability_issues.append({
-                "type": "monolithic_code",
-                "severity": "major",
-                "description": "Large code block should be organized into functions/classes"
-            })
-        
-        # Naming convention issues
-        bad_names = re.findall(r'\b[a-z][a-z0-9]*[A-Z]|\b[A-Z][a-z]*_|\bdef\s+[A-Z]', code)
-        if bad_names:
-            maintainability_issues.append({
-                "type": "naming_convention",
-                "severity": "minor",
-                "count": len(bad_names),
-                "description": f"Found {len(bad_names)} naming convention violations"
-            })
-        
-        # Magic numbers
-        magic_numbers = re.findall(r'\b\d{2,}\b', code)
-        if len(magic_numbers) > 3:
-            maintainability_issues.append({
-                "type": "magic_numbers",
-                "severity": "minor",
-                "count": len(magic_numbers),
-                "description": "Consider using named constants for numeric literals"
-            })
-        
-        maintainability_score = 1.0
-        if has_docstrings:
-            maintainability_score += 0.2
-        if has_functions or has_classes:
-            maintainability_score += 0.2
-        maintainability_score -= len(maintainability_issues) * 0.1
-        maintainability_score = max(0.0, min(1.0, maintainability_score))
-        
-        return {
-            "maintainability_score": maintainability_score,
-            "maintainability_issues": maintainability_issues,
-            "total_maintainability_issues": len(maintainability_issues),
-            "has_documentation": has_docstrings,
-            "is_well_organized": has_functions or has_classes,
-            "code_metrics": metrics
-        }
-    
-    @staticmethod
-    def calculate_overall_quality_score(
-        correctness: Dict[str, Any],
-        security: Dict[str, Any],
-        performance: Dict[str, Any],
-        maintainability: Dict[str, Any]
-    ) -> float:
-        """Calculate overall code quality score"""
-        # Weighted scoring
-        weights = {
-            "correctness": 0.35,
-            "security": 0.30,
-            "performance": 0.20,
-            "maintainability": 0.15
-        }
-        
-        score = (
-            correctness.get("correctness_score", 0.0) * weights["correctness"] +
-            security.get("security_score", 0.0) * weights["security"] +
-            performance.get("performance_score", 0.0) * weights["performance"] +
-            maintainability.get("maintainability_score", 0.0) * weights["maintainability"]
-        )
-        
-        return min(1.0, score)
-    
-    @staticmethod
-    def get_quality_grade(score: float) -> str:
-        """Convert score to quality grade"""
-        if score >= 0.9:
-            return "A (Excellent)"
-        elif score >= 0.8:
-            return "B (Very Good)"
-        elif score >= 0.7:
-            return "C (Good)"
-        elif score >= 0.6:
-            return "D (Acceptable)"
-        else:
-            return "F (Needs Major Improvement)"
-
-
-# Enhanced tool functions for Critic agent
-def comprehensive_code_review(
-    code: str, 
-    source_agent: str = "unknown",
-    review_focus: str = "comprehensive"
-) -> Dict[str, Any]:
-    """
-    Perform comprehensive multi-dimensional code review.
-    
-    Args:
-        code: The code to review
-        source_agent: Which agent generated the code (gemini, gpt4, claude)
-        review_focus: Type of review (comprehensive, security, performance, etc.)
-        
-    Returns:
-        Complete review analysis with structured feedback
-    """
-    try:
-        # Add line numbers for precise feedback
-        numbered_code = add_line_numbers(code)
-        
-        # Multi-dimensional analysis
-        correctness = CriticAnalysisEngine.analyze_correctness(code)
-        security = CriticAnalysisEngine.analyze_security(code)
-        performance = CriticAnalysisEngine.analyze_performance(code)
-        maintainability = CriticAnalysisEngine.analyze_maintainability(code)
-        
-        # Calculate overall quality
-        overall_quality = CriticAnalysisEngine.calculate_overall_quality_score(
-            correctness, security, performance, maintainability
-        )
-        
-        # Aggregate all issues
-        all_issues = []
-        all_issues.extend(correctness.get("logic_issues", []))
-        all_issues.extend(security.get("security_issues", []))
-        all_issues.extend(performance.get("performance_issues", []))
-        all_issues.extend(maintainability.get("maintainability_issues", []))
-        
-        # Count by severity
-        severity_counts = {
-            "critical": len([i for i in all_issues if i.get("severity") == "critical"]),
-            "major": len([i for i in all_issues if i.get("severity") == "major"]),
-            "minor": len([i for i in all_issues if i.get("severity") == "minor"])
-        }
-        
-        return {
-            "status": "reviewed",
-            "source_agent": source_agent,
-            "numbered_code": numbered_code.get("numbered_code", code),
-            "correctness_analysis": correctness,
-            "security_analysis": security,
-            "performance_analysis": performance,
-            "maintainability_analysis": maintainability,
-            "overall_quality_score": overall_quality,
-            "quality_grade": CriticAnalysisEngine.get_quality_grade(overall_quality),
-            "all_issues": all_issues,
-            "total_issues": len(all_issues),
-            "severity_counts": severity_counts,
-            "has_critical_issues": severity_counts["critical"] > 0,
-            "has_blocking_issues": severity_counts["critical"] > 0 or severity_counts["major"] > 3,
-            "review_complete": True
-        }
-        
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e),
-            "review_complete": False
-        }
-
-
-def generate_structured_feedback(
-    review_analysis: Dict[str, Any],
-    target_audience: str = "developer"
-) -> Dict[str, Any]:
-    """
-    Generate structured, actionable feedback from review analysis.
-    
-    Args:
-        review_analysis: Results from comprehensive_code_review
-        target_audience: Who the feedback is for (developer, refactor_agent, etc.)
-        
-    Returns:
-        Structured feedback with priorities and recommendations
-    """
-    try:
-        all_issues = review_analysis.get("all_issues", [])
-        severity_counts = review_analysis.get("severity_counts", {})
-        overall_quality = review_analysis.get("overall_quality_score", 0.0)
-        
-        # Prioritize feedback
-        critical_issues = [i for i in all_issues if i.get("severity") == "critical"]
-        major_issues = [i for i in all_issues if i.get("severity") == "major"]
-        minor_issues = [i for i in all_issues if i.get("severity") == "minor"]
-        
-        # Generate recommendations
-        recommendations = []
-        
-        if critical_issues:
-            recommendations.append({
-                "priority": "IMMEDIATE",
-                "category": "Critical Issues",
-                "action": "Fix all critical issues before deployment",
-                "issues": critical_issues[:5]  # Top 5 critical
-            })
-        
-        if major_issues:
-            recommendations.append({
-                "priority": "HIGH",
-                "category": "Major Issues", 
-                "action": "Address major issues to improve code quality",
-                "issues": major_issues[:5]  # Top 5 major
-            })
-        
-        if minor_issues and overall_quality > 0.7:
-            recommendations.append({
-                "priority": "MEDIUM",
-                "category": "Minor Improvements",
-                "action": "Consider addressing for better maintainability",
-                "issues": minor_issues[:3]  # Top 3 minor
-            })
-        
-        # Overall assessment
-        if overall_quality >= 0.8:
-            overall_assessment = "Code quality is good with minor improvements needed."
-        elif overall_quality >= 0.6:
-            overall_assessment = "Code quality is acceptable but requires attention to identified issues."
-        else:
-            overall_assessment = "Code quality needs significant improvement before deployment."
-        
-        return {
-            "status": "feedback_generated",
-            "overall_assessment": overall_assessment,
-            "quality_score": overall_quality,
-            "quality_grade": review_analysis.get("quality_grade", "Unknown"),
-            "total_issues_found": len(all_issues),
-            "severity_breakdown": severity_counts,
-            "structured_recommendations": recommendations,
-            "next_actions": _generate_next_actions(severity_counts, overall_quality),
-            "review_summary": _generate_review_summary(review_analysis),
-            "feedback_complete": True
-        }
-        
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e),
-            "feedback_complete": False
-        }
-
-
-def _generate_next_actions(severity_counts: Dict[str, int], quality_score: float) -> List[str]:
-    """Generate recommended next actions based on review results"""
-    actions = []
-    
-    if severity_counts.get("critical", 0) > 0:
-        actions.append("🚨 BLOCK deployment - critical issues must be fixed")
-        actions.append("🔧 Refactor code to address security/correctness issues")
-    elif severity_counts.get("major", 0) > 3:
-        actions.append("⚠️  Significant refactoring recommended")
-        actions.append("🔍 Focus on major issues before proceeding")
-    elif quality_score >= 0.8:
-        actions.append("✅ Code is ready with minor improvements")
-        actions.append("📝 Consider addressing minor issues for polish")
-    else:
-        actions.append("🔄 Moderate refactoring needed")
-        actions.append("📊 Re-review after improvements")
-    
-    return actions
-
-
-def _generate_review_summary(review_analysis: Dict[str, Any]) -> Dict[str, Any]:
-    """Generate executive summary of the review"""
     return {
-        "correctness": f"Score: {review_analysis.get('correctness_analysis', {}).get('correctness_score', 0):.2f}",
-        "security": f"Score: {review_analysis.get('security_analysis', {}).get('security_score', 0):.2f}",
-        "performance": f"Score: {review_analysis.get('performance_analysis', {}).get('performance_score', 0):.2f}",
-        "maintainability": f"Score: {review_analysis.get('maintainability_analysis', {}).get('maintainability_score', 0):.2f}",
-        "recommendation": "APPROVE" if review_analysis.get("overall_quality_score", 0) >= 0.7 else "NEEDS_WORK"
+        "has_critical_issues": has_critical,
+        "has_major_issues": has_major,
+        "raw_output": critic_output,
+        "parsed": False
     }
 
 
-def make_review_decision(
-    review_analysis: Dict[str, Any],
-    quality_threshold: float = 0.7
-) -> Dict[str, Any]:
+def extract_refactored_code(refactor_output: str) -> str:
     """
-    Make autonomous decision about code quality and next steps.
+    Extract the refactored code from refactor agent output.
     
     Args:
-        review_analysis: Results from comprehensive_code_review
-        quality_threshold: Minimum quality score for approval
+        refactor_output: Raw output from refactor agent
         
     Returns:
-        Decision with recommended actions
+        Extracted code
     """
-    overall_quality = review_analysis.get("overall_quality_score", 0.0)
-    has_critical_issues = review_analysis.get("has_critical_issues", False)
-    has_blocking_issues = review_analysis.get("has_blocking_issues", False)
+    # Look for code blocks
+    if "```python" in refactor_output:
+        match = re.search(r'```python\n(.*?)```', refactor_output, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+    elif "```" in refactor_output:
+        match = re.search(r'```\n(.*?)```', refactor_output, re.DOTALL)
+        if match:
+            return match.group(1).strip()
     
-    if has_critical_issues:
-        decision = {
-            "status": "rejected",
-            "action": "requires_immediate_refactoring",
-            "quality_score": overall_quality,
-            "reason": "Critical issues found - code must be refactored before deployment",
-            "blocking": True,
-            "refactor_priority": "CRITICAL"
-        }
-    elif has_blocking_issues:
-        decision = {
-            "status": "rejected",
-            "action": "requires_major_refactoring",
-            "quality_score": overall_quality,
-            "reason": "Multiple major issues found - significant refactoring needed",
-            "blocking": True,
-            "refactor_priority": "HIGH"
-        }
-    elif overall_quality >= quality_threshold:
-        decision = {
-            "status": "approved",
-            "action": "ready_for_delivery",
-            "quality_score": overall_quality,
-            "reason": f"Code meets quality standards (score: {overall_quality:.2f})",
-            "blocking": False,
-            "refactor_priority": "OPTIONAL"
-        }
-    else:
-        decision = {
-            "status": "conditional_approval",
-            "action": "minor_refactoring_recommended",
-            "quality_score": overall_quality,
-            "reason": f"Code is functional but could benefit from improvements (score: {overall_quality:.2f})",
-            "blocking": False,
-            "refactor_priority": "MEDIUM"
-        }
-    
-    return decision
+    # Return as-is if no code block found
+    return refactor_output
 
 
-def enhanced_format_critic_output(
-    review_analysis: Any = None,  # Changed to Any to handle all types
-    structured_feedback: Any = None,
-    review_decision: Any = None,
-    original_code: str = "",
-    source_agent: str = "unknown",
-    memory_check: Optional[Dict[str, Any]] = None,
-    input_validation: Optional[Dict[str, Any]] = None
-) -> Dict[str, Any]:
+def create_stop_condition(quality_threshold: float = 0.7) -> callable:
     """
-    Enhanced format function with ULTRA-ROBUST type checking and error handling.
-    This version can handle ANY input type and recover gracefully.
+    Create a stop condition function for the loop.
+    
+    Args:
+        quality_threshold: Minimum quality score to stop the loop
+        
+    Returns:
+        Stop condition function
     """
-    
-    # Helper function to safely extract data
-    def safe_extract(obj: Any, default: Dict[str, Any]) -> Dict[str, Any]:
-        """Safely extract dictionary from any object type"""
-        if isinstance(obj, dict):
-            return obj
-        elif isinstance(obj, str):
-            # Try to parse JSON if it's a string
-            try:
-                parsed = json.loads(obj)
-                if isinstance(parsed, dict):
-                    return parsed
-            except:
-                pass
-            # Return minimal structure with string data
-            return {**default, "raw_data": obj}
-        elif obj is None:
-            return default
-        else:
-            # Handle any other type
-            return {**default, "raw_data": str(obj)}
-    
-    # Define default structures for each parameter
-    default_review_analysis = {
-        "review_complete": False,
-        "total_issues": 0,
-        "overall_quality_score": 0.5,
-        "quality_grade": "Unknown",
-        "severity_counts": {"critical": 0, "major": 0, "minor": 0},
-        "all_issues": [],
-        "correctness_analysis": {"correctness_score": 0.5},
-        "security_analysis": {"security_score": 0.5},
-        "performance_analysis": {"performance_score": 0.5},
-        "maintainability_analysis": {"maintainability_score": 0.5}
-    }
-    
-    default_structured_feedback = {
-        "feedback_complete": False,
-        "overall_assessment": "Review incomplete - using default assessment",
-        "quality_score": 0.5,
-        "total_issues_found": 0,
-        "severity_breakdown": {"critical": 0, "major": 0, "minor": 0},
-        "structured_recommendations": [],
-        "next_actions": ["Manual review recommended"],
-        "review_summary": {}
-    }
-    
-    default_review_decision = {
-        "status": "pending",
-        "action": "manual_review_needed",
-        "quality_score": 0.5,
-        "reason": "Automated review incomplete",
-        "blocking": False,
-        "refactor_priority": "MEDIUM"
-    }
-    
-    # Safely extract all parameters
-    review_analysis = safe_extract(review_analysis, default_review_analysis)
-    structured_feedback = safe_extract(structured_feedback, default_structured_feedback)
-    review_decision = safe_extract(review_decision, default_review_decision)
-    
-    # Ensure optional parameters are dicts or None
-    if memory_check is not None and not isinstance(memory_check, dict):
-        memory_check = {"status": "error", "data": str(memory_check)}
-    
-    if input_validation is not None and not isinstance(input_validation, dict):
-        input_validation = {"status": "error", "data": str(input_validation)}
-    
-    # Clean the original code
-    original_code = str(original_code) if original_code else ""
-    source_agent = str(source_agent) if source_agent else "unknown"
-    
-    # Calculate review quality score with safe access
-    review_quality_score = 0.3  # Base score
-    
-    # Safely add bonuses
-    try:
-        if review_analysis.get("review_complete", False):
-            review_quality_score += 0.2
-        if structured_feedback.get("feedback_complete", False):
-            review_quality_score += 0.2
-        if review_analysis.get("total_issues", 0) > 0:
-            review_quality_score += 0.3
-    except Exception as e:
-        print(f"Warning: Error calculating review quality score: {e}")
-    
-    review_quality_score = min(1.0, review_quality_score)
-    
-    # Perform final validation with error handling
-    try:
-        feedback_text = structured_feedback.get("overall_assessment", "")
-        final_validation = validate_review_output_with_guardrails(feedback_text, original_code)
-    except Exception as e:
-        print(f"Warning: Final validation failed: {e}")
-        final_validation = {
-            "status": "validation_error",
-            "is_safe": True,
-            "is_appropriate": True,
-            "ready_for_delivery": True,
-            "error": str(e)
-        }
-    
-    # Save to memory with error handling
-    try:
-        memory_save_result = save_successful_review_to_memory(
-            reviewed_code=original_code,
-            review_analysis=review_analysis,
-            source_agent=source_agent,
-            review_quality_score=review_quality_score
-        )
-    except Exception as e:
-        print(f"Warning: Memory save failed: {e}")
-        memory_save_result = {
-            "status": "save_error",
-            "saved": False,
-            "error": str(e)
-        }
-    
-    # Build the final output
-    return {
-        "status": "review_completed_with_memory_and_guardrails",
-        "review_analysis": review_analysis,
-        "structured_feedback": structured_feedback,
-        "review_decision": review_decision,
-        "source_agent": source_agent,
-        "memory_integration": {
-            "input_check": memory_check or {"status": "not_performed"},
-            "save_result": memory_save_result
-        },
-        "guardrails_validation": {
-            "input_validation": input_validation or {"status": "not_performed"},
-            "final_validation": final_validation
-        },
-        "agent_metadata": {
-            "agent_name": "critic_agent",
-            "specialization": "Comprehensive multi-dimensional code review",
-            "model": "gpt-4o",
-            "review_authority": True,
-            "memory_enabled": True,
-            "guardrails_enabled": True,
-            "enhanced_version": "v3_ultra_robust"
-        },
-        "next_stage_ready": final_validation.get("ready_for_delivery", True),
-        "processing_summary": {
-            "review_quality_score": review_quality_score,
-            "memory_learning": memory_save_result.get("saved", False),
-            "safety_validated": final_validation.get("is_safe", True),
-            "ready_for_refactoring": review_decision.get("blocking", False),
-            "data_integrity": "recovered" if any("raw_data" in d for d in [review_analysis, structured_feedback, review_decision] if isinstance(d, dict)) else "intact"
-        }
-    }
-
-
-def perform_complete_review(
-    code: str,
-    source_agent: str = "unknown", 
-    review_focus: str = "comprehensive"
-) -> Dict[str, Any]:
-    """
-    Perform a complete review in one shot - easier for LLM to use.
-    This combines all review steps into a single function call.
-    """
-    try:
-        # Step 1: Input validation
-        input_validation = validate_review_input_with_guardrails(code, review_focus)
+    def should_stop(context: InvocationContext) -> bool:
+        """
+        Determine if the loop should stop based on the latest review results.
+        """
+        # Get the last event from context
+        last_messages = context.get_messages()
+        if not last_messages:
+            return False
         
-        # Step 2: Memory check
-        memory_check = check_memory_for_similar_reviews(code, source_agent)
+        # Look for critic agent output in recent messages
+        for msg in reversed(last_messages[-5:]):  # Check last 5 messages
+            if msg.get("author") == "critic_agent":
+                content = msg.get("content", {}).get("parts", [{}])[0].get("text", "")
+                review_results = extract_review_results(content)
+                
+                # Stop if no critical issues and quality is good
+                if not review_results.get("has_critical_issues", True):
+                    severity_counts = review_results.get("severity_counts", {})
+                    if severity_counts.get("critical", 0) == 0 and severity_counts.get("major", 0) <= 1:
+                        print("✓ Loop stopping: Code quality acceptable")
+                        return True
+                    
+                # Stop if quality score is above threshold
+                if review_results.get("quality_score", 0) >= quality_threshold:
+                    print(f"✓ Loop stopping: Quality score {review_results['quality_score']:.2f} >= {quality_threshold}")
+                    return True
         
-        # Step 3: Comprehensive review
-        review_analysis = comprehensive_code_review(code, source_agent, review_focus)
-        
-        # Step 4: Generate feedback
-        structured_feedback = generate_structured_feedback(review_analysis, "developer")
-        
-        # Step 5: Make decision
-        review_decision = make_review_decision(review_analysis)
-        
-        # Step 6: Format output
-        final_output = enhanced_format_critic_output(
-            review_analysis=review_analysis,
-            structured_feedback=structured_feedback,
-            review_decision=review_decision,
-            original_code=code,
-            source_agent=source_agent,
-            memory_check=memory_check,
-            input_validation=input_validation
-        )
-        
-        return final_output
-        
-    except Exception as e:
-        # Fallback manual review
-        return {
-            "status": "manual_review_fallback",
-            "error": str(e),
-            "manual_review": {
-                "assessment": "Automated review failed - manual analysis provided",
-                "issues_found": [
-                    {"type": "review_error", "description": f"Review system error: {str(e)}"}
-                ],
-                "recommendation": "Please review code manually"
-            },
-            "next_stage_ready": True
-        }
-
-
-# Create the enhanced Critic agent
-root_agent = Agent(
-    name="critic_agent",
-    model=LiteLlm(model="openai/gpt-4o"),
-    description="Expert code reviewer with ultra-robust error handling",
-    instruction="""You are the Enhanced Critic Agent with complete code review authority.
-
-IMPORTANT: Due to tool complexity, you have TWO options for reviewing code:
-
-OPTION 1 - SIMPLE (RECOMMENDED):
-Just call perform_complete_review(code, source_agent, review_focus) with:
-- code: The code to review
-- source_agent: "gemini", "gpt4", "claude", or "unknown"  
-- review_focus: "comprehensive", "security", "performance", etc.
-
-This will handle all review steps automatically!
-
-OPTION 2 - DETAILED (if Option 1 fails):
-Call each function in sequence:
-1. validate_review_input_with_guardrails(code, review_request)
-2. check_memory_for_similar_reviews(code, source_agent)
-3. comprehensive_code_review(code, source_agent, review_focus)
-4. generate_structured_feedback(review_analysis, "developer")
-5. make_review_decision(review_analysis)
-6. enhanced_format_critic_output(...)
-
-If tools fail, provide a manual review based on:
-- Correctness (35%): Logic, syntax, edge cases
-- Security (30%): Vulnerabilities, unsafe patterns
-- Performance (20%): Efficiency, complexity
-- Maintainability (15%): Documentation, organization
-
-For the test code:
-```python
-def authenticate_user(username, password):
-    if username == "admin" and password == "password123":
-        return True
-    else:
         return False
-```
+    
+    return should_stop
 
-Key issues to identify:
-- CRITICAL: Hardcoded credentials (security vulnerability)
-- MAJOR: No input validation
-- MAJOR: No password hashing/encryption
-- MAJOR: No error handling
-- MINOR: Missing documentation
-- MINOR: No type hints
 
-Always provide actionable feedback even if tools fail.""",
-    tools=[
-        # NEW: One-shot review function
-        FunctionTool(perform_complete_review),
+def format_loop_results(loop_output: str, iterations: int) -> Dict[str, Any]:
+    """
+    Format the final results from the loop.
+    
+    Args:
+        loop_output: Raw output from the loop
+        iterations: Number of iterations completed
         
-        # Original tools
-        FunctionTool(comprehensive_code_review),
-        FunctionTool(generate_structured_feedback),
-        FunctionTool(make_review_decision),
-        FunctionTool(enhanced_format_critic_output),
-        FunctionTool(validate_review_input_with_guardrails),
-        FunctionTool(check_memory_for_similar_reviews),
-        FunctionTool(save_successful_review_to_memory),
-        FunctionTool(validate_review_output_with_guardrails),
-        FunctionTool(analyze_code),
-        FunctionTool(estimate_complexity),
-        FunctionTool(validate_python_syntax),
-        FunctionTool(simple_code_safety_check),
-        FunctionTool(simple_output_validation),
-        FunctionTool(add_line_numbers),
-        FunctionTool(clean_code_string)
-    ],
-    output_key="critic_review_results"
+    Returns:
+        Formatted results
+    """
+    # Extract final code
+    final_code = extract_refactored_code(loop_output)
+    
+    # Extract final review
+    final_review = extract_review_results(loop_output)
+    
+    return {
+        "status": "loop_completed",
+        "iterations_completed": iterations,
+        "final_code": final_code,
+        "final_quality_score": final_review.get("quality_score", 0.0),
+        "remaining_issues": {
+            "critical": final_review.get("severity_counts", {}).get("critical", 0),
+            "major": final_review.get("severity_counts", {}).get("major", 0),
+            "minor": final_review.get("severity_counts", {}).get("minor", 0)
+        },
+        "improvement_achieved": iterations > 0,
+        "ready_for_production": not final_review.get("has_critical_issues", True)
+    }
+
+
+# Create wrapper agents if direct instances aren't available
+if not critic_agent_instance:
+    # Create a minimal critic agent for testing
+    critic_agent_instance = LlmAgent(
+        name="critic_agent",
+        model=LiteLlm(model="openai/gpt-4o"),
+        description="Code reviewer that identifies issues",
+        instruction="""Review the provided code and identify:
+        1. Critical issues (security vulnerabilities, bugs)
+        2. Major issues (performance, design flaws)
+        3. Minor issues (style, documentation)
+        
+        Provide a structured review with severity levels."""
+    )
+
+if not refactor_agent_instance:
+    # Create a minimal refactor agent for testing
+    refactor_agent_instance = LlmAgent(
+        name="refactor_agent",
+        model=LiteLlm(model="openai/gpt-4o"),
+        description="Code refactoring specialist",
+        instruction="""Refactor the code based on the review feedback.
+        Focus on fixing critical and major issues first.
+        Provide the improved code in a code block."""
+    )
+
+
+# Create the main Loop Agent
+root_agent = LoopAgent(
+    name="review_refactor_loop",
+    description="Iteratively reviews and refactors code until quality standards are met",
+    sub_agents=[critic_agent_instance, refactor_agent_instance],
+    max_iterations=5
 )
 
 
-# Test function for standalone testing
+# Create the root agent that orchestrates everything
+#  root_agent = Agent(
+#     name="review_loop_agent",
+#     model=LiteLlm(model="openai/gpt-4o"),
+#     description="Orchestrates iterative code review and refactoring until quality standards are met",
+#     instruction="""You are the Review-Refactor Loop Orchestrator. Your job is to:
+
+# 1. Take the user's code that needs improvement
+# 2. Prepare it for the review-refactor loop
+# 3. Run the loop (which automatically handles critic → refactor iterations)
+# 4. Present the final improved code and summary
+
+# The loop will automatically:
+# - Run the critic agent to review code
+# - Run the refactor agent to fix issues
+# - Repeat until quality is acceptable or max iterations reached
+
+# IMPORTANT: 
+# - First call prepare_code_for_review() to prepare the code
+# - Then simply state that you're starting the iterative review-refactor process
+# - The LoopAgent sub-agent will handle the iterations automatically
+# - After the loop completes, format and present the results
+
+# Example response:
+# "I'll help improve your code through iterative review and refactoring. Let me prepare it first...
+# [Call prepare_code_for_review]
+# Now I'll run the review-refactor loop to iteratively improve the code...
+# [The loop runs automatically]
+# Here's the improved code after X iterations:
+# [Present final code and summary]"
+# """,
+#     tools=[
+#         FunctionTool(prepare_code_for_review),
+#         FunctionTool(extract_review_results),
+#         FunctionTool(extract_refactored_code),
+#         FunctionTool(format_loop_results),
+#         FunctionTool(analyze_code),
+#         FunctionTool(wrap_code_in_markdown),
+#         FunctionTool(format_code_output)
+#     ],
+#     sub_agents=[loop_agent]  # The loop agent is a sub-agent
+# )
+
+
+# Test function
 if __name__ == "__main__":
-    print("🔍 Enhanced Critic Agent Ready!")
-    print("\n🎯 COMPLETE REVIEW AUTHORITY + MEMORY + GUARDRAILS:")
-    print("- Ultra-robust error handling for any input type")
-    print("- One-shot review function for easier use")
-    print("- Manual review fallback always available")
-    print("- Multi-dimensional comprehensive code analysis")
-    print("- Memory learning from past review patterns")
-    print("- Input/output safety validation")
+    print("🔄 Review-Refactor Loop Agent Ready!")
+    print("\n✨ Features:")
+    print("- Automatic iteration between critic and refactor agents")
+    print("- Stops when code quality is acceptable")
+    print("- Maximum 5 iterations to prevent infinite loops")
+    print("- Structured output with improvement tracking")
     
-    print("\n🔧 KEY IMPROVEMENTS:")
-    print("- perform_complete_review() - Single function for complete review")
-    print("- Ultra-robust type handling - Works with dict, string, None, etc.")
-    print("- Automatic JSON parsing for string inputs")
-    print("- Default structures for missing data")
-    print("- Graceful error recovery at every step")
-    print("- Manual review fallback instructions")
+    print("\n📋 Components:")
+    print(f"- Critic Agent: {'✓ Loaded' if critic_agent_instance else '✗ Using fallback'}")
+    print(f"- Refactor Agent: {'✓ Loaded' if refactor_agent_instance else '✗ Using fallback'}")
+    print("- Loop Agent: ✓ Configured")
     
-    print("\n🚀 USAGE:")
-    print("1. Run: adk run agents/critic_agent")
-    print("2. Or use: adk web (and select critic_agent)")
+    print("\n🚀 Usage:")
+    print("1. Run: adk run agents/review_loop_agent")
+    print("2. Provide code that needs improvement")
+    print("3. Watch the iterative improvement process")
     
-    print("\n💡 RECOMMENDED TEST:")
-    print("Try: perform_complete_review(code='def authenticate_user(username, password): return username==\"admin\" and password==\"password123\"', source_agent='test')")
-    
-    print("\n✨ The agent will now:")
-    print("- Work reliably even with complex function chaining")
-    print("- Provide reviews even when tools fail")
-    print("- Handle any input type gracefully")
-    print("- Always give actionable feedback")
+    print("\n💡 Example Test:")
+    print('Try: "Please improve this code:"')
+    print('def authenticate(u, p):')
+    print('    return u == "admin" and p == "password123"')

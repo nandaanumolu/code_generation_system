@@ -25,6 +25,10 @@ import sys
 from pathlib import Path
 import re
 
+import os
+os.environ["OTEL_SDK_DISABLED"] = "true"
+os.environ["OPENTELEMETRY_SUPPRESS_INSTRUMENTATION"] = "true"
+
 # Add shared to path for imports
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
@@ -686,7 +690,7 @@ def enhanced_format_gpt4_output(
     
     return {
         "status": "completed_with_memory_and_guardrails",
-        "generated_code": formatted_code.get("formatted_code", code),
+        "generated_code": formatted_code,
         "raw_code": code,
         "robustness_analysis": analysis,
         "robustness_decision": decision,
